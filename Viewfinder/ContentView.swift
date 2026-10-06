@@ -13,9 +13,13 @@ struct ContentView: View {
             if isAuthorized {
                 ZStack {
                     if let photo {
-                        Image(uiImage: photo)
-                            .resizable()
-                            .scaledToFill()
+                        Color.clear
+                            .overlay {
+                                Image(uiImage: photo)
+                                    .resizable()
+                                    .scaledToFill()
+                            }
+                            .clipped()
                             .ignoresSafeArea()
                     } else {
                         CameraPreview(camera: camera)
@@ -40,6 +44,8 @@ struct ContentView: View {
                                     photo = nil
                                 } label: {
                                     Image(systemName: "xmark")
+                                        .font(.title2)
+                                        .frame(width: 44, height: 44)
                                 }
                                 .buttonStyle(.glass)
                                 .buttonBorderShape(.circle)
@@ -48,7 +54,7 @@ struct ContentView: View {
                             }
                             Spacer()
                         }
-                        .padding()
+                        .padding(16)
                     } else {
                         VStack {
                             Spacer()
