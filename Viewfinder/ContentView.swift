@@ -1,5 +1,7 @@
 import SwiftUI
 import AVFoundation
+import Vision
+import CoreImage.CIFilterBuiltins
 
 struct ContentView: View {
     @State private var isAuthorized = false
@@ -13,7 +15,7 @@ struct ContentView: View {
             if isAuthorized {
                 ZStack {
                     if let photo {
-                        WhiteningView(photo: photo) {
+                        DebugMaskView(photo: photo) {
                             self.photo = nil
                         }
                     } else {
@@ -77,46 +79,41 @@ private func crosshairCenter(in size: CGSize) -> CGPoint {
     CGPoint(x: size.width / 2, y: size.height / 2 - size.height * 0.05)
 }
 
-/// Turns the captured photo white, outside-in toward the crosshair, over 10 s.
-private struct WhiteningView: View {
+/// Debug screen: shows the photo with the foreground instance under the crosshair tinted red.
+private struct DebugMaskView: View {
     let photo: UIImage
     let onTap: () -> Void
-    @State private var progress: CGFloat = 0
-
-    // Hole scale at progress 0; the hole's fully-clear radius is 0.5 * scale * farthest-corner
-    // distance, so 2.2 clears every corner.
-    private let blurStartScale: CGFloat = 2.2
-    // The white hole is larger than the blur hole, so white trails behind the blur.
-    private let whiteStartScale: CGFloat = 2.9
+    @State private var tint: UIImage?
+    @State private var isProcessing = true
 
     var body: some View {
         GeometryReader { geometry in
             let center = crosshairCenter(in: geometry.size)
-            let radius = max(
-                hypot(center.x, center.y),
-                hypot(geometry.size.width - center.x, center.y),
-                hypot(center.x, geometry.size.height - center.y),
-                hypot(geometry.size.width - center.x, geometry.size.height - center.y)
-            )
 
             ZStack {
-                photoLayer
+                filled(photo)
 
-                photoLayer
-                    .blur(radius: 40, opaque: true)
-                    .mask {
-                        holeMask(center: center, radius: radius, scale: blurStartScale * (1 - progress))
-                    }
-
-                Color.white
-                    .mask {
-                        holeMask(center: center, radius: radius, scale: whiteStartScale * (1 - progress))
-                    }
+                if let tint {
+                    filled(tint)
+                }
 
                 CrosshairIcon()
                     .position(center)
-                    .opacity(1 - progress)
                     .accessibilityHidden(true)
+
+                if isProcessing {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(.white)
+                        .position(x: geometry.size.width / 2, y: geometry.size.height * 0.75)
+                }
+            }
+            .task {
+                let size = geometry.size
+                tint = await Task.detached {
+                    InstanceTinter.tint(photo: photo, viewSize: size, crosshair: center)
+                }.value
+                isProcessing = false
             }
         }
         .ignoresSafeArea()
@@ -126,47 +123,70 @@ private struct WhiteningView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Return to camera")
         .accessibilityAddTraits(.isButton)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 10)) {
-                progress = 1
-            }
-        }
     }
 
-    private var photoLayer: some View {
+    /// Same scaledToFill + clip layout for the photo and the tint, so they stay aligned.
+    private func filled(_ image: UIImage) -> some View {
         Color.clear
             .overlay {
-                Image(uiImage: photo)
+                Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
             }
             .clipped()
     }
+}
 
-    /// Opaque everywhere except a soft-edged circular hole centered on `center`.
-    /// The hole is fully clear out to 0.5 * scale * radius and fades out by scale * radius.
-    private func holeMask(center: CGPoint, radius: CGFloat, scale: CGFloat) -> some View {
-        ZStack {
-            Color.black
-            Circle()
-                .fill(
-                    RadialGradient(
-                        stops: [
-                            .init(color: .black, location: 0),
-                            .init(color: .black, location: 0.5),
-                            .init(color: .clear, location: 1)
-                        ],
-                        center: .center,
-                        startRadius: 0,
-                        endRadius: radius
-                    )
-                )
-                .frame(width: radius * 2, height: radius * 2)
-                .scaleEffect(scale)
-                .position(center)
-                .blendMode(.destinationOut)
+private enum InstanceTinter {
+    /// Returns a 50% red overlay (same pixel size and aspect as the upright photo) covering the
+    /// foreground instance under `crosshair`, or nil if that point is background or Vision fails.
+    /// `viewSize` is the full-screen size the photo is shown in with scaledToFill.
+    static func tint(photo: UIImage, viewSize: CGSize, crosshair: CGPoint) -> UIImage? {
+        // Bake the orientation flag into the pixels so Vision and the view agree on "up".
+        let pixelSize = CGSize(width: photo.size.width * photo.scale, height: photo.size.height * photo.scale)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let upright = UIGraphicsImageRenderer(size: pixelSize, format: format).image { _ in
+            photo.draw(in: CGRect(origin: .zero, size: pixelSize))
         }
-        .compositingGroup()
+        guard let cgImage = upright.cgImage else { return nil }
+
+        // Crosshair in photo pixels, undoing the scaledToFill scale and center crop.
+        let scale = max(viewSize.width / pixelSize.width, viewSize.height / pixelSize.height)
+        let offsetX = (viewSize.width - pixelSize.width * scale) / 2
+        let offsetY = (viewSize.height - pixelSize.height * scale) / 2
+        let px = (crosshair.x - offsetX) / scale
+        let py = (crosshair.y - offsetY) / scale
+        guard px >= 0, py >= 0, px < pixelSize.width, py < pixelSize.height else { return nil }
+
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let observation = request.results?.first
+        else { return nil }
+
+        // The label map may have a different resolution than the photo; sample it normalized.
+        let labels = observation.instanceMask
+        CVPixelBufferLockBaseAddress(labels, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(labels, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(labels) else { return nil }
+        let lx = min(Int(px / pixelSize.width * CGFloat(CVPixelBufferGetWidth(labels))), CVPixelBufferGetWidth(labels) - 1)
+        let ly = min(Int(py / pixelSize.height * CGFloat(CVPixelBufferGetHeight(labels))), CVPixelBufferGetHeight(labels) - 1)
+        let label = Int(base.load(fromByteOffset: ly * CVPixelBufferGetBytesPerRow(labels) + lx, as: UInt8.self))
+        guard label != 0 else { return nil }
+
+        guard let mask = try? observation.generateScaledMaskForImage(forInstances: IndexSet(integer: label), from: handler) else {
+            return nil
+        }
+        let maskImage = CIImage(cvPixelBuffer: mask)
+        let filter = CIFilter.blendWithMask()
+        filter.inputImage = CIImage(color: CIColor(red: 1, green: 0, blue: 0, alpha: 0.5)).cropped(to: maskImage.extent)
+        filter.backgroundImage = CIImage(color: .clear).cropped(to: maskImage.extent)
+        filter.maskImage = maskImage
+        guard let output = filter.outputImage,
+              let result = CIContext().createCGImage(output, from: maskImage.extent)
+        else { return nil }
+        return UIImage(cgImage: result)
     }
 }
 
